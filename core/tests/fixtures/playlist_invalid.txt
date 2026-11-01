@@ -1,0 +1,3 @@
+# invalid
+https://example.test/ok
+ftp://example.test/nope

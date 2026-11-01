@@ -1,0 +1,3 @@
+﻿# CRLF playlist
+https://example.test/contact/1
+https://example.test/contact/2

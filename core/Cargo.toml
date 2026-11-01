@@ -1,0 +1,8 @@
+[package]
+name = "nfc-bulk-url-writer-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+
+[lib]
+path = "src/lib.rs"

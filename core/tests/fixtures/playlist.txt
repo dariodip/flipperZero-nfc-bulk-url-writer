@@ -1,0 +1,6 @@
+# NFC Bulk URL Writer batch contacts
+https://example.test/contact/1
+
+http://example.test/contact/2
+# duplicate on purpose
+https://example.test/contact/1
