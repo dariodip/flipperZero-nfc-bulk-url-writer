@@ -42,9 +42,12 @@ attempts and violates the no-password rule.
 ### Write and verify
 
 1. Encode the URL into an exact Type 2 Tag TLV before touching the tag.
-2. Start a custom MfUltralight session as above and read the metadata. Compare
-   the UID with the UID that was just validated. A mismatch aborts as
-   `TagChanged`.
+2. Start a custom MfUltralight session as above and read the metadata. The
+   validated model from the preceding read phase is passed with the request;
+   when it is known, the session skips the GET_VERSION exchange and reproduces
+   the model identity from the validated model, while fully re-reading the
+   identity, lock and configuration pages. Compare the UID with the UID that
+   was just validated. A mismatch aborts as `TagChanged`.
 3. Validate the tag again (model, CC, locks, protection, capacity).
 4. Read the pages covering the TLV so the last partial page keeps its existing
    bytes, then write only those pages, starting at page 4. No metadata page,

@@ -14,7 +14,12 @@ use nfc_bulk_url_writer_core::name::FixedName;
 use nfc_bulk_url_writer_core::playlist::PlaylistStats;
 use nfc_bulk_url_writer_core::workflow::{Summary, WorkflowErrorKind};
 
-use crate::storage::{FolderList, PlaylistList};
+use crate::storage::{FolderList, PlaylistList, append_bytes};
+
+/// Stack buffer for [`push_wrapped`]: enough for `width * max_lines` display
+/// characters plus one newline per line (the current callers use width 20 and
+/// 4 lines, requiring 84 bytes).
+const LINE_WRAP_BUFFER: usize = 128;
 
 pub const VIEW_STARTUP: u32 = 0;
 pub const VIEW_PLAYLIST: u32 = 1;
@@ -192,7 +197,7 @@ impl Ui {
                     continue;
                 };
                 label.clear();
-                push_bytes(&mut label, name.as_bytes());
+                append_bytes(&mut label, name.as_bytes());
                 sys::submenu_add_item(
                     self.playlist,
                     label.as_c_ptr(),
@@ -208,7 +213,7 @@ impl Ui {
     pub fn show_folder(&mut self, header: &[u8], folders: &FolderList, has_parent: bool) {
         let mut title = FuriString::new();
         title.push_str("Folder: ");
-        push_bytes(&mut title, header);
+        append_bytes(&mut title, header);
         unsafe {
             sys::submenu_reset(self.folder);
             sys::submenu_set_header(self.folder, title.as_c_ptr());
@@ -234,7 +239,7 @@ impl Ui {
                     continue;
                 };
                 label.clear();
-                push_bytes(&mut label, name.as_bytes());
+                append_bytes(&mut label, name.as_bytes());
                 sys::submenu_add_item(
                     self.folder,
                     label.as_c_ptr(),
@@ -287,14 +292,13 @@ impl Ui {
         if url.is_empty() {
             url_text.push_str("No URL");
         } else {
-            push_bytes(&mut url_text, url);
+            append_bytes(&mut url_text, url);
         }
-        let mut state = FuriString::new();
-        state.push_str(if index > 1 {
-            "Waiting for next tag"
+        let state: &CStr = if index > 1 {
+            c"Waiting for next tag"
         } else {
-            "Waiting for tag"
-        });
+            c"Waiting for tag"
+        };
         unsafe {
             sys::widget_reset(self.waiting);
             sys::widget_add_string_element(
@@ -313,7 +317,7 @@ impl Ui {
                 sys::AlignLeft,
                 sys::AlignTop,
                 sys::FontSecondary,
-                state.as_c_ptr(),
+                state.as_ptr(),
             );
             sys::widget_add_text_scroll_element(self.waiting, 0, 30, 128, 34, url_text.as_c_ptr());
             sys::widget_add_string_element(
@@ -657,44 +661,42 @@ impl Ui {
     }
 }
 
-fn push_bytes(target: &mut FuriString, bytes: &[u8]) {
-    for &byte in bytes {
-        target.push(byte as char);
-    }
-}
-
 fn push_wrapped(target: &mut FuriString, bytes: &[u8], width: usize, max_lines: usize) {
+    let mut scratch = [0u8; LINE_WRAP_BUFFER];
+    let mut length = 0usize;
     let mut line_len = 0usize;
     let mut lines = 1usize;
-    let mut truncated = false;
     for &byte in bytes {
         if byte == b'\n' {
             if lines == max_lines {
-                truncated = true;
-                break;
+                append_bytes(target, &scratch[..length]);
+                target.push_str("...");
+                return;
             }
-            target.push('\n');
+            scratch[length] = b'\n';
+            length += 1;
             line_len = 0;
             lines += 1;
             continue;
         }
         if line_len == width {
             if lines == max_lines {
-                truncated = true;
-                break;
+                append_bytes(target, &scratch[..length]);
+                target.push_str("...");
+                return;
             }
-            target.push('\n');
+            scratch[length] = b'\n';
+            length += 1;
             line_len = 0;
             lines += 1;
         }
-        target.push(if byte.is_ascii_graphic() || byte == b' ' {
-            byte as char
+        scratch[length] = if byte.is_ascii_graphic() || byte == b' ' {
+            byte
         } else {
-            ' '
-        });
+            b' '
+        };
+        length += 1;
         line_len += 1;
     }
-    if truncated {
-        target.push_str("...");
-    }
+    append_bytes(target, &scratch[..length]);
 }

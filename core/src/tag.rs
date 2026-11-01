@@ -35,6 +35,15 @@ impl TagModel {
         }
     }
 
+    /// GET_VERSION storage-size byte reported by this model.
+    pub fn storage_size(self) -> u8 {
+        match self {
+            Self::Ntag213 => 0x0F,
+            Self::Ntag215 => 0x11,
+            Self::Ntag216 => 0x13,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Ntag213 => "NTAG213",
@@ -349,6 +358,16 @@ mod tests {
         assert_eq!(TagModel::from_storage_size(0x13), Some(TagModel::Ntag216));
         for unsupported in [0x00, 0x0E, 0x10, 0x12, 0x14, 0xFF] {
             assert_eq!(TagModel::from_storage_size(unsupported), None);
+        }
+    }
+
+    #[test]
+    fn storage_size_round_trips() {
+        for model in [TagModel::Ntag213, TagModel::Ntag215, TagModel::Ntag216] {
+            assert_eq!(
+                TagModel::from_storage_size(model.storage_size()),
+                Some(model)
+            );
         }
     }
 

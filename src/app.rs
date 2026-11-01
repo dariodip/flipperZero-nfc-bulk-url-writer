@@ -17,7 +17,9 @@ use nfc_bulk_url_writer_core::tag::MAX_UID_LEN;
 use nfc_bulk_url_writer_core::workflow::{Action, Screen, Workflow, WorkflowErrorKind};
 
 use crate::nfc::worker::{EVENT_NFC_RESULT, NfcRequest, NfcResult, NfcWorker};
-use crate::storage::{self, FolderList, LoadedSession, PlaylistList, PlaylistLoadError};
+use crate::storage::{
+    self, FileLineSource, FolderList, LoadedSession, PlaylistList, PlaylistLoadError,
+};
 use crate::ui::Ui;
 
 const DEBUG_FLAG: &[u8] = b"/ext/apps_data/nfc-bulk-url-writer/debug";
@@ -27,6 +29,22 @@ const AUTO_URL_PATH: &[u8] = b"/ext/apps_data/nfc-bulk-url-writer/auto-url.txt";
 const EVENT_NFC_TIMEOUT: u32 = 0x101;
 const EVENT_BACK_PENDING: u32 = 0x104;
 const EVENT_AUTO_START: u32 = 0x102;
+
+// TEMP DIAGNOSTIC: traces one runtime mark with the Furi tick. Remove after
+// locating the start-batch block.
+fn mark(text: core::fmt::Arguments) {
+    let tick = unsafe { sys::furi_get_tick() };
+    let mut line = FuriString::new();
+    let _ = write!(line, "MARK {text} t={tick}");
+    storage::trace(line.as_c_str().to_str().unwrap_or("MARK ?"));
+}
+
+// TEMP DIAGNOSTIC: same, for static labels anywhere in the app.
+pub(crate) fn point(label: &str) {
+    storage::trace(label);
+}
+
+// TEMP DIAGNOSTIC: same, for static labels outside app.rs.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutoMode {
@@ -66,6 +84,8 @@ pub struct App {
     folder_mode: bool,
     playlist_path: [u8; MAX_PATH_LEN],
     playlist_path_len: usize,
+    playlist_stream: Option<FileLineSource>,
+    playlist_stream_pos: Option<u32>,
     url: [u8; MAX_URL_LEN],
     url_len: usize,
     required_tlv: usize,
@@ -108,6 +128,8 @@ impl App {
             folder_mode: false,
             playlist_path: [0u8; MAX_PATH_LEN],
             playlist_path_len: 0,
+            playlist_stream: None,
+            playlist_stream_pos: None,
             url: [0u8; MAX_URL_LEN],
             url_len: 0,
             required_tlv: 0,
@@ -380,6 +402,7 @@ impl App {
                             required_tlv: self.required_tlv as u16,
                             url_len: self.url_len as u16,
                             url: self.url,
+                            model: Some(model),
                         });
                     } else {
                         Self::auto_line(format_args!("AUTO-WRITE error=worker"));
@@ -716,11 +739,16 @@ impl App {
         // Starting a new batch replaces any previous session. If the new
         // session is aborted before its first save, the old progress is gone,
         // which is what "Start new" promises.
+        mark(format_args!("confirm-start total={}", stats.total));
         let _ = storage::clear_session();
+        mark(format_args!("confirm-cleared"));
         match Session::new(stats.fingerprint, stats.total, bytes) {
             Ok(session) => {
+                mark(format_args!("confirm-session"));
                 let action = self.workflow.playlist_loaded(session);
+                mark(format_args!("confirm-action"));
                 self.render(action);
+                mark(format_args!("confirm-rendered"));
             }
             Err(error) => {
                 self.render_error(WorkflowErrorKind::Session(error));
@@ -809,6 +837,63 @@ impl App {
         }
     }
 
+    /// Streams the playlist entry at `index` from the playlist file.
+    ///
+    /// The file stays open between tags: within a batch a later entry only
+    /// needs the next lines, so instead of re-opening and re-reading the whole
+    /// playlist the stream continues from its current position. A retry, a
+    /// restart or a resume cannot continue the stream, so those request an
+    /// absolute index, which re-opens the file. Re-opens always happen after
+    /// the previous handle was dropped: the storage service freezes when two
+    /// handles to the same path are open at the same time.
+    fn read_playlist_entry(&mut self, index: u32) -> Result<usize, PlaylistLoadError> {
+        // Absolute index: valid for a fresh (just opened) handle or a re-open.
+        let mut relative = index;
+        if self.playlist_stream.is_some() {
+            match self.playlist_stream_pos {
+                Some(last) if index > last => {
+                    // Later entry than everything consumed: continue the stream.
+                    relative = index - last - 1;
+                }
+                Some(_) => {
+                    // Rewind (retry, restart or new playlist): drop the opened
+                    // handle first so the new open is strictly sequential.
+                    self.playlist_stream = None;
+                    self.playlist_stream = Some(storage::open_playlist_path(
+                        &self.playlist_path[..self.playlist_path_len],
+                    )?);
+                    self.playlist_stream_pos = None;
+                    mark(format_args!("stream-reopen"));
+                }
+                None => {}
+            }
+        } else {
+            self.playlist_stream = Some(storage::open_playlist_path(
+                &self.playlist_path[..self.playlist_path_len],
+            )?);
+            mark(format_args!("stream-open"));
+        }
+        let Some(source) = self.playlist_stream.as_mut() else {
+            return Err(PlaylistLoadError::Read);
+        };
+        let read = storage::playlist_entry_from_source(source, relative, &mut self.url);
+        match read {
+            Ok(length) => {
+                self.playlist_stream_pos = Some(index);
+                mark(format_args!(
+                    "stream-read ok idx={index} rel={relative} len={length}"
+                ));
+                Ok(length)
+            }
+            Err(error) => {
+                self.playlist_stream = None;
+                self.playlist_stream_pos = None;
+                mark(format_args!("stream-read err idx={index} rel={relative}"));
+                Err(error)
+            }
+        }
+    }
+
     fn enter_waiting(&mut self) {
         let Some(session) = self.workflow.session() else {
             self.render_error(WorkflowErrorKind::Session(SessionError::Corrupt));
@@ -817,11 +902,8 @@ impl App {
         let index = session.next;
         let total = session.total;
 
-        let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = self.playlist_path_len.min(MAX_PATH_LEN);
-        path[..path_len].copy_from_slice(&self.playlist_path[..path_len]);
-
-        let read = storage::playlist_entry_path(&path[..path_len], index, &mut self.url);
+        let read = self.read_playlist_entry(index);
+        mark(format_args!("waiting-read result={:?}", read.is_err()));
         let length = match read {
             Ok(length) => length,
             Err(PlaylistLoadError::Missing) => {
@@ -849,13 +931,16 @@ impl App {
         }
 
         self.ui.show_waiting(index + 1, total, &self.url[..length]);
+        mark(format_args!("waiting-shown"));
         if self.ensure_worker() {
+            mark(format_args!("waiting-worker"));
             let _ = self.worker.as_ref().map(|worker| {
                 worker.send(NfcRequest::ReadAndValidate {
                     required_tlv: self.required_tlv as u16,
                     full_dump: false,
                 })
             });
+            mark(format_args!("waiting-sent"));
         }
     }
 
@@ -891,6 +976,7 @@ impl App {
                     required_tlv: self.required_tlv as u16,
                     url_len: self.url_len as u16,
                     url: self.url,
+                    model: self.workflow.tag_model(),
                 })
             });
         }
@@ -1317,10 +1403,12 @@ impl App {
         if !self.workflow.take_dirty() {
             return true;
         }
+        mark(format_args!("persist-enter"));
         let Some(session) = self.workflow.session() else {
             return true;
         };
         if storage::save_session(session).is_err() {
+            mark(format_args!("persist-failed"));
             self.stop_worker();
             self.dialog_mode = DialogMode::ExitOnly;
             self.ui.show_message(
@@ -1401,9 +1489,7 @@ impl App {
 }
 
 fn push_path_text(target: &mut FuriString, path: &[u8]) {
-    for &byte in path {
-        target.push(byte as char);
-    }
+    storage::append_bytes(target, path);
 }
 
 fn push_hex(target: &mut FuriString, bytes: &[u8]) {

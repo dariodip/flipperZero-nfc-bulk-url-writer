@@ -307,7 +307,16 @@ fn path_to_cstring(path: &[u8]) -> FuriString {
     text
 }
 
-fn append_bytes(target: &mut FuriString, bytes: &[u8]) {
+/// Appends `bytes` to `target`. ASCII bytes (the upstream-valid case for
+/// paths, names and labels) are copied in one bulk call; other bytes keep the
+/// per-character encoding so the result matches `push(byte as char)` exactly.
+pub(crate) fn append_bytes(target: &mut FuriString, bytes: &[u8]) {
+    if bytes.iter().all(|&byte| byte.is_ascii()) {
+        if let Ok(text) = core::str::from_utf8(bytes) {
+            target.push_str(text);
+            return;
+        }
+    }
     for &byte in bytes {
         target.push(byte as char);
     }
@@ -323,7 +332,7 @@ pub fn display_name_from_path(path: &[u8]) -> Option<FixedName> {
 /// Streaming line source over a Flipper file.
 pub struct FileLineSource {
     file: File,
-    buffer: [u8; 256],
+    buffer: [u8; 512],
     position: usize,
     filled: usize,
     eof: bool,
@@ -333,7 +342,7 @@ impl FileLineSource {
     fn new(file: File) -> Self {
         Self {
             file,
-            buffer: [0u8; 256],
+            buffer: [0u8; 512],
             position: 0,
             filled: 0,
             eof: false,
@@ -392,6 +401,9 @@ impl LineSource for FileLineSource {
 }
 
 /// Opens a playlist by its stored absolute path.
+///
+/// The returned stream can serve multiple entry reads; it must be dropped
+/// before the same path is opened again.
 pub fn open_playlist_path(path: &[u8]) -> Result<FileLineSource, StorageError> {
     let mut c_path = FuriString::new();
     append_bytes(&mut c_path, path);
@@ -424,6 +436,10 @@ pub fn scan_playlist_path(path: &[u8]) -> Result<PlaylistStats, PlaylistLoadErro
 }
 
 /// Reads one URL from a stored playlist path.
+///
+/// Re-opens the playlist and streams from the first line. Prefer
+/// [`playlist_entry_from_source`] when the file can stay open between reads.
+#[allow(dead_code)]
 pub fn playlist_entry_path(
     path: &[u8],
     index: u32,
@@ -432,6 +448,20 @@ pub fn playlist_entry_path(
     let mut source = open_playlist_path(path).map_err(PlaylistLoadError::from)?;
     let mut line = [0u8; playlist::LINE_BUFFER_SIZE];
     playlist::entry_at(&mut source, index, &mut line, out).map_err(PlaylistLoadError::Parse)
+}
+
+/// Reads one URL from an already-open playlist stream.
+///
+/// `index` is zero-based counting from the stream's *current* position, which
+/// lets a caller whose playlist file stays open between productions consume
+/// later entries without re-opening or re-reading the file.
+pub fn playlist_entry_from_source(
+    source: &mut FileLineSource,
+    index: u32,
+    out: &mut [u8],
+) -> Result<usize, PlaylistLoadError> {
+    let mut line = [0u8; playlist::LINE_BUFFER_SIZE];
+    playlist::entry_at(source, index, &mut line, out).map_err(PlaylistLoadError::Parse)
 }
 
 /// Result of trying to load a session from storage.

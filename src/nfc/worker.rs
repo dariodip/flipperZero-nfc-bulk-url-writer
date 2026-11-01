@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use flipperzero_sys as sys;
 use nfc_bulk_url_writer_core::errors::{NdefError, TagError};
 use nfc_bulk_url_writer_core::ndef;
-use nfc_bulk_url_writer_core::tag::{self, MAX_UID_LEN, TagModel, TagSnapshot};
+use nfc_bulk_url_writer_core::tag::{self, MAX_UID_LEN, TagModel, TagSnapshot, VERSION_LEN};
 use nfc_bulk_url_writer_core::{MAX_TLV_LEN, MAX_URL_LEN};
 
 use super::compat;
@@ -33,10 +33,15 @@ pub enum NfcRequest {
     /// Read the tag metadata (and optionally a full user-area dump).
     ReadAndValidate { required_tlv: u16, full_dump: bool },
     /// Re-read the tag, confirm its UID, write the TLV, read back and verify.
+    ///
+    /// `model` carries the model that was validated during the immediately
+    /// preceding read phase; when known, the write session skips the
+    /// GET_VERSION exchange and reconstructs the model identity from it.
     WriteAndVerify {
         required_tlv: u16,
         url_len: u16,
         url: [u8; MAX_URL_LEN],
+        model: Option<TagModel>,
     },
     /// Wait until the programmed tag is removed or replaced.
     CheckRemoval { uid: [u8; MAX_UID_LEN], uid_len: u8 },
@@ -286,9 +291,10 @@ fn worker_loop(context: &mut WorkerContext) {
                 required_tlv,
                 url_len,
                 url,
+                model,
             } => {
                 let length = (url_len as usize).min(MAX_URL_LEN);
-                if !handle_write(context, required_tlv as usize, &url[..length]) {
+                if !handle_write(context, required_tlv as usize, &url[..length], model) {
                     break;
                 }
             }
@@ -331,6 +337,8 @@ fn detect_once(context: &mut WorkerContext) -> WaitOutcome {
     }
 }
 
+/// Streaming the model into `Operation::Write` lets the write session skip
+/// the GET_VERSION round-trip when the model was validated moments before.
 #[derive(Clone, Copy)]
 enum Operation<'a> {
     Read {
@@ -342,6 +350,7 @@ enum Operation<'a> {
         url: &'a [u8],
         expected_uid: [u8; MAX_UID_LEN],
         expected_uid_len: u8,
+        model: Option<TagModel>,
     },
     Removal {
         expected_uid: [u8; MAX_UID_LEN],
@@ -401,7 +410,8 @@ impl SessionCallback<'_> {
                 url,
                 expected_uid,
                 expected_uid_len,
-            } => self.execute_write(poller, tlv, url, expected_uid, expected_uid_len),
+                model,
+            } => self.execute_write(poller, tlv, url, expected_uid, expected_uid_len, model),
             Operation::Removal {
                 expected_uid,
                 expected_uid_len,
@@ -467,17 +477,28 @@ impl SessionCallback<'_> {
         url: &[u8],
         expected_uid: [u8; MAX_UID_LEN],
         expected_uid_len: u8,
+        model: Option<TagModel>,
     ) -> NfcResult {
-        let (model, _) = match read_metadata(poller, &mut self.snapshot) {
-            Ok(values) => values,
-            Err(error) => return NfcResult::Rejected(error),
-        };
+        match model {
+            Some(model) => {
+                if let Err(error) = read_identity(poller, &mut self.snapshot, model) {
+                    return NfcResult::Rejected(error);
+                }
+            }
+            None => {
+                if let Err(error) = read_metadata(poller, &mut self.snapshot).map(|_| ()) {
+                    return NfcResult::Rejected(error);
+                }
+            }
+        }
         if !same_uid(&self.snapshot, expected_uid, expected_uid_len) {
             return NfcResult::TagChanged;
         }
-        if let Err(error) = tag::validate_metadata(&self.snapshot, tlv.len()) {
-            return NfcResult::Rejected(error);
-        }
+        let info = match tag::validate_metadata(&self.snapshot, tlv.len()) {
+            Ok(info) => info,
+            Err(error) => return NfcResult::Rejected(error),
+        };
+        let model = info.model;
 
         // Fill the tag's NDEF area with the new TLV followed by zeros. This
         // removes stale bytes from previous messages (some readers mishandle
@@ -646,6 +667,41 @@ fn read_uid(
     Ok(())
 }
 
+/// Reads the identity, lock and configuration pages for a model known in
+/// advance, skipping the GET_VERSION exchange.
+///
+/// The write session runs directly after the read session validated the tag,
+/// so the model's storage-size byte is reproduced instead of re-read; the
+/// page reads themselves are unchanged, keeping the full re-validation of the
+/// Capability Container, locks and protection.
+fn read_identity(
+    poller: *mut sys::MfUltralightPoller,
+    snapshot: &mut TagSnapshot,
+    model: TagModel,
+) -> Result<(), TagError> {
+    // UID, static locks, Capability Container.
+    read_pages(poller, snapshot, 0, 3)?;
+    // Dynamic lock page and configuration pages. The dynamic lock page is
+    // immediately before the first configuration page.
+    let config = model.config_page();
+    read_pages(poller, snapshot, config - 1, config + 2)?;
+    read_pages(poller, snapshot, config, config + 3)?;
+    snapshot.set_pages_read(12);
+
+    let mut version = [0u8; VERSION_LEN];
+    version[6] = model.storage_size();
+    snapshot.set_version(version);
+
+    let page0 = snapshot.page(0).unwrap_or([0u8; 4]);
+    let page1 = snapshot.page(1).unwrap_or([0u8; 4]);
+    // NTAG21x use a 7-byte UID: page 0 holds UID0-2 and BCC0, page 1 holds
+    // UID3-6.
+    snapshot.set_uid(&[
+        page0[0], page0[1], page0[2], page1[0], page1[1], page1[2], page1[3],
+    ]);
+    Ok(())
+}
+
 fn run_session(
     context: &mut WorkerContext,
     operation: Operation<'_>,
@@ -742,7 +798,12 @@ fn handle_read(context: &mut WorkerContext, required_tlv: usize, full_dump: bool
     }
 }
 
-fn handle_write(context: &mut WorkerContext, required_tlv: usize, url: &[u8]) -> bool {
+fn handle_write(
+    context: &mut WorkerContext,
+    required_tlv: usize,
+    url: &[u8],
+    model: Option<TagModel>,
+) -> bool {
     let mut tlv = [0u8; MAX_TLV_LEN];
     let encoded = match ndef::encode(url, &mut tlv) {
         Ok(encoded) => encoded,
@@ -765,6 +826,7 @@ fn handle_write(context: &mut WorkerContext, required_tlv: usize, url: &[u8]) ->
             url,
             expected_uid: uid,
             expected_uid_len: uid_len,
+            model,
         },
         true,
     ) {
